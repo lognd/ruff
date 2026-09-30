@@ -5301,7 +5301,14 @@ impl<'db> Parameters<'db> {
         } else {
             self.data.kind
         };
-        Self::new(value, kind).expand_starred_variadic_annotations(db)
+        let parameters = Self::new(value, kind);
+        if type_mapping.is_structural() {
+            // Binding and unfolding can temporarily expose recursive variables. Expanding a
+            // starred annotation here would perform semantic operations on that open body.
+            parameters
+        } else {
+            parameters.expand_starred_variadic_annotations(db)
+        }
     }
     pub(crate) fn len(&self) -> usize {
         self.data.value.len()

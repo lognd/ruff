@@ -88,8 +88,12 @@ impl<'db> NamedItem<'db> {
                 type_alias.qualified_name(db).components_excluding_self()
             }
             NamedItem::Recursive(recursive) => {
-                QualifiedTypeAliasName::new(db, recursive.definition(db), recursive.name(db))
-                    .components_excluding_self()
+                recursive
+                    .alias(db)
+                    .map_or_else(Vec::new, |(definition, name)| {
+                        QualifiedTypeAliasName::new(db, definition, name)
+                            .components_excluding_self()
+                    })
             }
         }
     }
@@ -153,6 +157,8 @@ pub struct DisplaySettings<'db> {
     visited_function_types: Rc<FxHashSet<FunctionType<'db>>>,
     /// Callable signatures can refer back to the same lambda through its lazy return type.
     visited_callable_types: Rc<FxHashSet<CallableType<'db>>>,
+    /// Anonymous recursive binders expand their body once before displaying a backreference.
+    visited_recursive_types: Rc<FxHashSet<RecursiveType<'db>>>,
     /// Whether to hide the return type of the outermost signature.
     /// Return types of nested callable types inside parameters are still shown.
     hide_return_type: bool,
@@ -688,7 +694,9 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
                 self.record_class(db, ClassLiteral::Static(alias.origin(db)));
             }
             Type::TypeAlias(type_alias) => self.record_type_alias(db, type_alias),
-            Type::Recursive(recursive) => self.record(db, NamedItem::Recursive(recursive)),
+            Type::Recursive(recursive) if recursive.alias(db).is_some() => {
+                self.record(db, NamedItem::Recursive(recursive));
+            }
             // Visit the class (as if it were a nominal-instance type)
             // rather than the protocol members, if it is a class-based protocol.
             // (For the purposes of displaying the type, we'll use the class name.)
@@ -710,8 +718,14 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
     }
 
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
-        // Only the alias name and its arguments are displayed, not its unfolded body.
-        if let Some(arguments) = recursive.arguments(db) {
+        if recursive.alias(db).is_none() {
+            if let Some(unfolded) = recursive
+                .unfold(db, &recursive.environment(db))
+                .into_unfolded()
+            {
+                self.visit_type(db, unfolded);
+            }
+        } else if let Some(arguments) = recursive.arguments(db) {
             walk_specialization_types(db, arguments, self);
         }
     }
@@ -1783,19 +1797,33 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
                     alias.materialization_kind(db),
                     f,
                 ),
-            Type::Recursive(recursive) => TypeAliasDisplay {
-                db,
-                ty: self.ty,
-                definition: recursive.definition(db),
-                name: recursive.name(db),
-                settings: self.settings.clone(),
+            Type::Recursive(recursive) => {
+                if let Some((definition, name)) = recursive.alias(db) {
+                    TypeAliasDisplay {
+                        db,
+                        ty: self.ty,
+                        definition,
+                        name,
+                        settings: self.settings.clone(),
+                    }
+                    .fmt_specialized(
+                        self.env,
+                        recursive.arguments(db),
+                        recursive.materialization_kind(db),
+                        f,
+                    )
+                } else if self.settings.visited_recursive_types.contains(&recursive) {
+                    f.write_str("Divergent")
+                } else {
+                    let mut settings = self.settings.clone();
+                    Rc::make_mut(&mut settings.visited_recursive_types).insert(recursive);
+                    recursive
+                        .unfold(db, self.env)
+                        .into_type()
+                        .display_with(db, self.env, settings)
+                        .fmt_detailed(f)
+                }
             }
-            .fmt_specialized(
-                self.env,
-                recursive.arguments(db),
-                recursive.materialization_kind(db),
-                f,
-            ),
             Type::NewTypeInstance(newtype) => f.with_type(self.ty).write_str(newtype.name(db)),
         }
     }

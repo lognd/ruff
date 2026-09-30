@@ -231,10 +231,19 @@ fn normalize_collection_use_constraints<'db>(
 
 /// Infer all types for a [`Definition`] (including sub-expressions).
 /// Use when resolving a place use or public type of a place.
+///
+/// Class and function definitions have a stable identity, but decorators can replace their
+/// binding with a recursive structural type. Seed those bindings with a closed reference and
+/// bind occurrences of that reference during recovery. Flow-sensitive assignments and loop
+/// headers continue to use the widening performed by ordinary inference-cycle recovery.
 #[salsa::tracked(
     returns(ref),
     cycle_initial=|db, id, definition: Definition<'db>| {
-        DefinitionInference::cycle_initial(db, definition, Type::divergent(id))
+        let mut initial = DefinitionInference::cycle_initial(db, definition, Type::divergent(id));
+        if matches!(definition.kind(db), DefinitionKind::Class(_) | DefinitionKind::Function(_)) {
+            initial.types = DefinitionTypes::Binding(Type::Recursive(RecursiveType::initial_binding(db, definition, id)));
+        }
+        initial
     },
     cycle_fn=|db: &'db dyn Db, cycle, previous: &DefinitionInference<'db>, inference: DefinitionInference<'db>, definition: Definition<'db>| {
         inference.cycle_normalized(db, previous, cycle, definition)
@@ -1279,7 +1288,26 @@ impl<'db> DefinitionTypes<'db> {
         ty: Type<'db>,
     ) -> Type<'db> {
         if let Some(previous_ty) = previous.binding_type(owner, definition) {
-            ty.cycle_normalized(db, env, previous_ty, cycle)
+            if owner == definition
+                && matches!(
+                    definition.kind(db),
+                    DefinitionKind::Class(_) | DefinitionKind::Function(_)
+                )
+            {
+                let recursive = RecursiveType::initial_binding(db, definition, cycle.id());
+                // Widen successive closed bodies using ordinary inference recovery. Unioning
+                // the previous binder itself would introduce a new self-reference instead.
+                let previous_ty = if let Type::Recursive(previous) = previous_ty
+                    && recursive.is_identity_reference(db, previous_ty)
+                {
+                    previous.unfold(db, env).into_type()
+                } else {
+                    previous_ty
+                };
+                recursive.bind(db, env, ty.cycle_normalized(db, env, previous_ty, cycle))
+            } else {
+                ty.cycle_normalized(db, env, previous_ty, cycle)
+            }
         } else {
             ty.recursive_type_normalized(db, env, cycle)
         }

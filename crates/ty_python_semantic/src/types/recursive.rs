@@ -140,9 +140,22 @@ impl RecursiveSubstitution<'_> {
     }
 }
 
-/// Identifies an alias query and names its recursive binder and variables.
+/// Identifies the query that owns a recursive binder and its variables.
+/// Alias and runtime binding inference can query the same definition independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RecursiveCycle(salsa::Id);
+pub enum RecursiveCycle {
+    Alias(salsa::Id),
+    Binding(salsa::Id),
+}
+
+impl RecursiveCycle {
+    fn marker(self) -> Type<'static> {
+        match self {
+            Self::Alias(id) => Type::divergent_alias(id),
+            Self::Binding(id) => Type::divergent(id),
+        }
+    }
+}
 
 impl get_size2::GetSize for RecursiveCycle {}
 
@@ -154,10 +167,10 @@ impl get_size2::GetSize for RecursiveCycle {}
 /// Use the binding operations in this module to construct recursive types.
 #[salsa::interned(debug, constructor=new_internal, heap_size=ruff_memory_usage::heap_size)]
 pub struct RecursiveType<'db> {
-    /// The defining symbol of the implicit alias, including for qualified references.
+    /// The definition whose inferred type contains this recursion.
     #[returns(copy)]
     pub(super) definition: Definition<'db>,
-    /// Names the binder and distinguishes provisional types of different alias queries.
+    /// Names the binder and distinguishes provisional types of different queries.
     #[returns(copy)]
     cycle: RecursiveCycle,
     #[returns(copy)]
@@ -191,7 +204,7 @@ impl<'db> RecursiveType<'db> {
             // Nested bodies can refer to an enclosing binder. Close only the cycle marker,
             // so recovery never exposes an unbound variable as a standalone type.
             if let Some(Type::RecursiveVar(variable)) = summary.cycle {
-                summary.cycle = Some(Type::divergent_alias(variable.cycle(db).0));
+                summary.cycle = Some(variable.cycle(db).marker());
             }
             summary
         }
@@ -206,7 +219,7 @@ impl<'db> RecursiveType<'db> {
         cycle: salsa::Id,
         parameters: Option<GenericContext<'db>>,
     ) -> Self {
-        let cycle = RecursiveCycle(cycle);
+        let cycle = RecursiveCycle::Alias(cycle);
         let arguments = parameters.map(|parameters| parameters.identity_specialization(db));
         Self::new_internal(
             db,
@@ -216,6 +229,17 @@ impl<'db> RecursiveType<'db> {
             arguments,
             None,
         )
+    }
+
+    /// Preserve a class or function binding's identity while its decorators are inferred.
+    /// Unfolding the provisional reference still produces the ordinary inference-cycle marker.
+    pub(super) fn initial_binding(
+        db: &'db dyn Db,
+        definition: Definition<'db>,
+        id: salsa::Id,
+    ) -> Self {
+        let cycle = RecursiveCycle::Binding(id);
+        Self::new_internal(db, definition, cycle, Type::divergent(id), None, None)
     }
 
     /// Close recursive occurrences after inferring an alias's constructor expression.
@@ -236,9 +260,23 @@ impl<'db> RecursiveType<'db> {
         )
     }
 
-    /// Bind references to this alias's query cycle in a closed inference result.
-    /// Each bound occurrence retains its arguments and refers to this constructor's cycle.
-    fn bind(
+    /// Whether a type applies this binder to its own arguments without materialization.
+    /// The body can differ because a reference may come from an earlier inference iteration.
+    pub(super) fn is_identity_reference(self, db: &'db dyn Db, ty: Type<'db>) -> bool {
+        matches!(ty, Type::Recursive(other)
+            if other.cycle(db) == self.cycle(db)
+                && other.arguments(db) == self.arguments(db)
+                && other.materialization_kind(db).is_none())
+    }
+
+    /// Close the equation `self = original` by binding its recursive references.
+    ///
+    /// Guarded references retain their structure and type arguments. Unguarded cycles retain
+    /// the provisional marker; in particular, `self | T` is not simplified to `T`.
+    ///
+    /// The input and result are closed. This operation neither joins successive approximations
+    /// nor performs inference widening; callers choose which equation to close.
+    pub(super) fn bind(
         self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -254,7 +292,7 @@ impl<'db> RecursiveType<'db> {
         );
         // Alias arguments can expose a reference without introducing a container.
         if body.has_unguarded_alias_cycle(db) {
-            Type::divergent_alias(self.cycle(db).0)
+            self.cycle(db).marker()
         } else if body == original {
             // Binding changes a closed type only by introducing references to this binder.
             body
@@ -312,13 +350,9 @@ impl<'db> RecursiveType<'db> {
     }
 
     /// The source alias's definition and name, if this binder comes from an alias.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Keep alias metadata optional for inferred recursive types"
-    )]
     pub(super) fn alias(self, db: &'db dyn Db) -> Option<(Definition<'db>, &'db str)> {
-        // Only implicit alias inference constructs recursive types at present.
-        Some((self.definition(db), self.name(db)))
+        matches!(self.cycle(db), RecursiveCycle::Alias(_))
+            .then(|| (self.definition(db), self.name(db)))
     }
 
     /// Restore the formal arguments and remove materialization for constructor analysis.
@@ -437,6 +471,24 @@ impl<'db> RecursiveType<'db> {
             | TypeMapping::FreshenBoundTypeVars { .. }
             | TypeMapping::BindSelf(_)
             | TypeMapping::ReplaceSelf { .. } => {
+                if self.alias(db).is_none() {
+                    // Inferred bindings can contain free variables directly in their bodies.
+                    // Substitute in the closed unfolding, then bind its recursive references
+                    // again so every subsequent unfolding retains the substitution.
+                    return visitor.visit(db, Type::Recursive(self), mapping, || {
+                        self.unfold(db, visitor.env)
+                            .map(|unfolded| {
+                                let mapped =
+                                    unfolded.apply_type_mapping_impl(db, mapping, tcx, visitor);
+                                if mapped == unfolded {
+                                    Type::Recursive(self)
+                                } else {
+                                    self.bind(db, visitor.env, mapped)
+                                }
+                            })
+                            .into_type()
+                    });
+                }
                 // These mappings substitute free variables, which are captured by the alias's
                 // arguments. Its formal body must remain independent of the calling context.
                 let arguments = self
@@ -746,5 +798,194 @@ impl Type<'_> {
             !matches!(self, Self::RecursiveVar(_)),
             "semantic operation on an unbound recursive variable"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::DbWithWritableSystem as _;
+    use salsa::plumbing::AsId;
+    use ty_python_core::ProgramFile;
+
+    use super::*;
+    use crate::db::tests::{TestDb, setup_db};
+    use crate::place::global_symbol;
+    use crate::types::{KnownClass, RecursivelyDefined, UnionType};
+
+    fn binding_reference<'db>(db: &'db TestDb, name: &str) -> anyhow::Result<RecursiveType<'db>> {
+        let file = system_path_to_file(db, "/src/bindings.py")?;
+        let file = ProgramFile::new(db, file, db.program_environment().program(db));
+        let definition = global_symbol(db, file, name)
+            .place
+            .expect_type()
+            .as_function_literal()
+            .context("expected a function")?
+            .definition(db);
+        Ok(RecursiveType::initial_binding(
+            db,
+            definition,
+            definition.as_id(),
+        ))
+    }
+
+    #[test]
+    fn binding_a_guarded_equation_is_stable() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file("/src/bindings.py", "def first(): ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let initial = binding_reference(db, "first")?;
+        let tuple = |tail| Type::heterogeneous_tuple(db, &env, [Type::int_literal(1), tail]);
+        let expected = initial.bind(db, &env, tuple(Type::Recursive(initial)));
+        let Type::Recursive(recursive) = expected else {
+            anyhow::bail!("expected a guarded recursive type");
+        };
+
+        // Older approximations name the same recursive variable, regardless of their bodies.
+        assert!(initial.is_identity_reference(db, expected));
+        assert_eq!(initial.bind(db, &env, tuple(expected)), expected);
+        assert_eq!(recursive.unfold(db, &env).into_type(), tuple(expected));
+        assert_eq!(
+            initial.bind(db, &env, recursive.unfold(db, &env).into_type()),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binding_an_unguarded_equation_is_conservative() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file("/src/bindings.py", "def first(): ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let binding = binding_reference(db, "first")?;
+        let definition = binding.definition(db);
+        let alias = RecursiveType::initial(db, definition, definition.as_id(), None);
+
+        for initial in [binding, alias] {
+            // Construct the equation without union simplification consuming its self-reference.
+            let union = Type::Union(UnionType::new(
+                db,
+                Box::from([Type::int_literal(1), Type::Recursive(initial)]),
+                RecursivelyDefined::No,
+            ));
+            assert_eq!(initial.bind(db, &env, union), initial.cycle(db).marker());
+            assert_eq!(
+                initial.bind(db, &env, Type::Recursive(initial)),
+                initial.cycle(db).marker(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn binding_preserves_foreign_and_materialized_references() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file("/src/bindings.py", "def first(): ...\ndef second(): ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let initial = binding_reference(db, "first")?;
+        let foreign = binding_reference(db, "second")?;
+        let Type::Recursive(recursive) = initial.bind(
+            db,
+            &env,
+            Type::heterogeneous_tuple(db, &env, [Type::unknown(), Type::Recursive(initial)]),
+        ) else {
+            anyhow::bail!("expected a guarded recursive type");
+        };
+
+        for reference in [
+            foreign,
+            recursive.with_materialization(db, Some(MaterializationKind::Top)),
+            recursive.with_materialization(db, Some(MaterializationKind::Bottom)),
+        ] {
+            assert!(!initial.is_identity_reference(db, Type::Recursive(reference)));
+            let union = Type::Union(UnionType::new(
+                db,
+                Box::from([Type::int_literal(1), Type::Recursive(reference)]),
+                RecursivelyDefined::No,
+            ));
+            assert_eq!(initial.bind(db, &env, union), union);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn binding_mutually_recursive_equations() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file("/src/bindings.py", "def first(): ...\ndef second(): ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let first = binding_reference(db, "first")?;
+        let second = binding_reference(db, "second")?;
+        let tuple = |head, tail| Type::heterogeneous_tuple(db, &env, [head, tail]);
+
+        // a = (1, b), b = (2, a). Closing b captures the reference nested inside a's body.
+        let first_body = first.bind(
+            db,
+            &env,
+            tuple(Type::int_literal(1), Type::Recursive(second)),
+        );
+        let second_ty = second.bind(db, &env, tuple(Type::int_literal(2), first_body));
+        let Type::Recursive(second_recursive) = second_ty else {
+            anyhow::bail!("expected a mutually recursive type");
+        };
+        let first_ty = first.bind(db, &env, tuple(Type::int_literal(1), second_ty));
+        assert_eq!(
+            second_recursive.unfold(db, &env).into_type(),
+            tuple(Type::int_literal(2), first_ty),
+        );
+        assert_eq!(
+            second.bind(db, &env, tuple(Type::int_literal(2), first_ty)),
+            second_ty,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn specialize_inferred_recursive_type() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_file("/src/factory.py", "def factory[T](value: T) -> T: ...")?;
+        let db = &db;
+        let env = db.program_environment();
+        let file = system_path_to_file(db, "/src/factory.py")?;
+        let file = ProgramFile::new(db, file, env.program(db));
+        let function = global_symbol(db, file, "factory")
+            .place
+            .expect_type()
+            .as_function_literal()
+            .context("expected a function")?;
+        let typevar = function
+            .signature(db)
+            .overloads
+            .first()
+            .and_then(|signature| signature.generic_context)
+            .and_then(|context| context.variables(db).next())
+            .context("expected a type parameter")?;
+        let definition = function.definition(db);
+        let initial = RecursiveType::initial_binding(db, definition, definition.as_id());
+        // The free T in μa. tuple[T, a] must be substituted in every unfolding.
+        let recursive = initial.bind(
+            db,
+            &env,
+            Type::heterogeneous_tuple(db, &env, [Type::TypeVar(typevar), Type::Recursive(initial)]),
+        );
+        let int = KnownClass::Int.to_instance(db, &env);
+        let specialized = recursive.apply_type_mapping(
+            db,
+            &env,
+            &TypeMapping::ApplySpecialization(ApplySpecialization::Single(typevar, int)),
+            TypeContext::default(),
+        );
+        let Type::Recursive(specialized) = specialized else {
+            anyhow::bail!("expected a closed recursive type");
+        };
+        assert_eq!(
+            specialized.unfold(db, &env).into_type(),
+            Type::heterogeneous_tuple(db, &env, [int, Type::Recursive(specialized)]),
+        );
+        Ok(())
     }
 }
