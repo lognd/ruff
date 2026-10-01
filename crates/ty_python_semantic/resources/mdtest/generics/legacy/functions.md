@@ -2998,6 +2998,59 @@ def repeat(flag: bool):
     reveal_type(value)  # revealed: tuple[Literal[1]] | Unknown
 ```
 
+## Recursive growth beside unchanged type arguments
+
+An unchanged nested argument does not hide growth in another argument.
+
+```py
+from typing import TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+
+def grow(value: tuple[A, B]) -> tuple[list[A], B]:
+    return ([value[0]], value[1])
+
+def repeat(flag: bool, padding: list[list[list[int]]]):
+    value = (1, padding)
+    while flag:
+        value = grow(value)
+    reveal_type(value)  # revealed: tuple[Literal[1], list[list[list[int]]]] | Unknown
+```
+
+## Diagnostics in recursively growing assignments
+
+Widening a recursive assignment preserves errors in the call and its arguments.
+
+```py
+from typing import TypeVar
+
+A = TypeVar("A")
+
+def grow(value: tuple[A], extra: object) -> tuple[list[A]]:
+    return ([value[0]],)
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = grow(value, missing)  # error: [unresolved-reference]
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = grow(value, (1).missing)  # error: [unresolved-attribute]
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = grow(value, 1, 2)  # error: [too-many-positional-arguments]
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = grow(value, 1 + "a")  # error: [unsupported-operator]
+```
+
 ## Generic property setters implementing protocols
 
 These deliberately contrived setters could use `object` and `int` directly instead of method-scoped

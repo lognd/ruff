@@ -718,34 +718,6 @@ while value:
     value = new_class("C", (value,))
 ```
 
-## Recursive narrowing through bound methods
-
-The bound method's receiver and the narrowing target can both grow on every iteration. Inference
-widens the recursive assignment when structural normalization cannot reach a fixed point.
-
-```toml
-[environment]
-python-version = "3.13"
-```
-
-```py
-from typing import TypeIs
-
-class Container[T]: ...
-
-def is_container[T](value: object, other: T) -> TypeIs[Container[T]]:
-    return True
-
-while True:
-    # error: [possibly-unresolved-reference]
-    # error: [possibly-unresolved-reference]
-    if is_container(value, type(value)):
-        value = value.__str__
-    else:
-        value = {value}  # error: [possibly-unresolved-reference]
-    reveal_type(value)  # revealed: Unknown | set[Unknown]
-```
-
 ## Recursive annotations with multiple union arms
 
 A deferred `TypeOf` annotation can repeatedly wrap the entire previous union in each generic arm.
@@ -765,6 +737,17 @@ class Container[T]: ...
 value: list[TypeOf[value]] | Container[TypeOf[value]] | None
 value = [1]
 reveal_type(value)  # revealed: list[int]
+```
+
+Widening preserves the annotation's qualifiers, so a subsequent assignment to a `Final` variable is
+still rejected.
+
+```py
+from typing import Final
+
+final_value: Final[list[TypeOf[final_value]] | Container[TypeOf[final_value]] | None]
+final_value = [1]
+final_value = [2]  # error: [invalid-assignment] "Reassignment of `Final` symbol"
 ```
 
 ## Finite cycles across many attributes

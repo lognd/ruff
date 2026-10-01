@@ -514,6 +514,22 @@ def count(n: int, index: Literal[0, 1]):
     reveal_type(value)  # revealed: int
 ```
 
+An unchanged part of an intermediate tuple does not cause this finite inference to widen to
+`Unknown`, even when the tuple has many elements.
+
+```py
+def count(
+    n: int,
+    index: Literal[0, 1],
+    padding: tuple[int, int, int, int, int, int, int, int],
+):
+    value = 0
+    for _ in range(n):
+        value = ((0, value)[index] + 1, padding)[0]
+    reveal_type(value)  # revealed: int
+    zero: Literal[0] = value  # error: [invalid-assignment]
+```
+
 ## Union subscript access with non-indexable type
 
 ```py

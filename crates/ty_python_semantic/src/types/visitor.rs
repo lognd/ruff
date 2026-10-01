@@ -3,7 +3,7 @@ use crate::ProgramEnvironment;
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use ty_python_core::definition::Definition;
 
@@ -800,6 +800,213 @@ impl TypeSearchMode {
     const fn should_visit_alias_arguments(self) -> bool {
         matches!(self, Self::IncludeAliasArguments)
     }
+}
+
+/// Returns the maximum constructor depth of `ty` and the maximum nesting depth of any typevar that
+/// it contains.
+///
+/// Atomic types and bare typevars have constructor depth zero. The typevar depth is `0` if `ty`
+/// does not contain any typevars.
+pub(super) fn max_constructor_and_typevar_depth<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> (u16, u16) {
+    type_depths(db, env, ty, false)
+}
+
+/// Returns the constructor depth of stored types, including alias arguments, without inferring
+/// alias bodies or other lazy attributes.
+fn constructor_depth<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> u16 {
+    type_depths(db, env, ty, true).0
+}
+
+/// Detect additional constructor nesting in corresponding parts of successive approximations.
+/// Unchanged arguments must not mask growth in their siblings. Union alternatives are compared
+/// independently so that adding literals or other alternatives of the same shape is not growth.
+pub(super) fn has_constructor_growth<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    current: Type<'db>,
+    previous: Type<'db>,
+) -> bool {
+    struct Children<'a, 'db> {
+        env: &'a ProgramEnvironment<'db>,
+        types: RefCell<SmallVec<[Type<'db>; 4]>>,
+    }
+
+    impl<'db> TypeVisitor<'db> for Children<'_, 'db> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            false
+        }
+
+        fn visit_type(&self, _db: &'db dyn Db, ty: Type<'db>) {
+            self.types.borrow_mut().push(ty);
+        }
+
+        fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
+            if let Some(arguments) = alias.specialization(db) {
+                walk_specialization_types(db, arguments, self);
+            }
+        }
+
+        fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
+            if let Some(arguments) = recursive.arguments(db) {
+                walk_specialization_types(db, arguments, self);
+            }
+        }
+    }
+
+    fn compare<'db>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        current: Type<'db>,
+        previous: Type<'db>,
+        seen: &mut FxHashMap<(Type<'db>, Type<'db>), bool>,
+    ) -> bool {
+        if current == previous {
+            return false;
+        }
+        if let Some(result) = seen.get(&(current, previous)) {
+            return *result;
+        }
+        // Break recursive edges and reuse comparisons of shared subtrees.
+        seen.insert((current, previous), false);
+        let result = match (current, previous) {
+            (Type::Union(current), _) => current
+                .elements(db)
+                .iter()
+                .any(|current| compare(db, env, *current, previous, seen)),
+            (_, Type::Union(previous)) => previous
+                .elements(db)
+                .iter()
+                .all(|previous| compare(db, env, current, *previous, seen)),
+            _ => {
+                let children = |ty: Type<'db>| {
+                    let visitor = Children {
+                        env,
+                        types: RefCell::default(),
+                    };
+                    if !ty.is_type_var()
+                        && let TypeKind::NonAtomic(ty) = TypeKind::from(ty)
+                    {
+                        walk_non_atomic_type(db, ty, &visitor);
+                    }
+                    visitor.types.into_inner()
+                };
+                let current_children = children(current);
+                let previous_children = children(previous);
+                if std::mem::discriminant(&current) == std::mem::discriminant(&previous)
+                    && !current_children.is_empty()
+                    && current_children.len() == previous_children.len()
+                {
+                    current_children
+                        .into_iter()
+                        .zip(previous_children)
+                        .any(|(current, previous)| compare(db, env, current, previous, seen))
+                } else {
+                    constructor_depth(db, env, current) > constructor_depth(db, env, previous)
+                }
+            }
+        };
+        seen.insert((current, previous), result);
+        result
+    }
+
+    compare(db, env, current, previous, &mut FxHashMap::default())
+}
+
+fn type_depths<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    include_alias_arguments: bool,
+) -> (u16, u16) {
+    struct TypeDepthVisitor<'a, 'db> {
+        env: &'a ProgramEnvironment<'db>,
+        active: RefCell<FxHashSet<Type<'db>>>,
+        current_depth: Cell<u16>,
+        max_constructor_depth: Cell<u16>,
+        max_typevar_depth: Cell<u16>,
+        include_alias_arguments: bool,
+    }
+
+    impl<'db> TypeVisitor<'db> for TypeDepthVisitor<'_, 'db> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            false
+        }
+
+        fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
+            if self.include_alias_arguments
+                && let Some(arguments) = alias.specialization(db)
+            {
+                walk_specialization_types(db, arguments, self);
+            }
+        }
+
+        fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
+            if self.include_alias_arguments
+                && let Some(arguments) = recursive.arguments(db)
+            {
+                walk_specialization_types(db, arguments, self);
+            }
+        }
+
+        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+            if ty.is_type_var() {
+                self.max_typevar_depth
+                    .set(self.max_typevar_depth.get().max(self.current_depth.get()));
+                return;
+            }
+
+            let non_atomic = match TypeKind::from(ty) {
+                TypeKind::Atomic => return,
+                // A non-generic nominal instance is an opaque leaf. Its class literal
+                // identifies the leaf but does not add nested type structure.
+                TypeKind::NonAtomic(NonAtomicType::NominalInstance(instance))
+                    if !instance.class(db, self.env).is_generic() =>
+                {
+                    return;
+                }
+                TypeKind::NonAtomic(non_atomic) => non_atomic,
+            };
+
+            if !self.active.borrow_mut().insert(ty) {
+                return;
+            }
+
+            let current_depth = self.current_depth.get();
+            let nested_depth = current_depth.saturating_add(1);
+            self.current_depth.set(nested_depth);
+            self.max_constructor_depth
+                .set(self.max_constructor_depth.get().max(nested_depth));
+            walk_non_atomic_type(db, non_atomic, self);
+            self.current_depth.set(current_depth);
+            self.active.borrow_mut().remove(&ty);
+        }
+    }
+
+    let visitor = TypeDepthVisitor {
+        env,
+        active: RefCell::default(),
+        current_depth: Cell::default(),
+        max_constructor_depth: Cell::default(),
+        max_typevar_depth: Cell::default(),
+        include_alias_arguments,
+    };
+    visitor.visit_type(db, ty);
+    (
+        visitor.max_constructor_depth.get(),
+        visitor.max_typevar_depth.get(),
+    )
 }
 
 /// Shared implementation for type searches.

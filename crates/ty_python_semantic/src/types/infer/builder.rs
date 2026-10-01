@@ -27,7 +27,7 @@ use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
-    CollectionUseConstraints, DeferredAndUndecorated, DefinitionInference,
+    CollectionUseConstraints, CycleWidening, DeferredAndUndecorated, DefinitionInference,
     DefinitionInferenceExtra, DefinitionTypes, ExpressionInference, ExpressionInferenceExtra,
     FrozenMap, FrozenSet, FrozenValueMap, FunctionDecoratorInference, InferenceRegion,
     OtherDefinitionInferenceExtra, ScopeInference, ScopeInferenceExtra, infer_deferred_types,
@@ -12203,6 +12203,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .into_boxed_slice(),
                     type_expression_flags: FrozenMap::from(type_expression_flags),
                     cycle_recovery,
+                    cycle_widening: CycleWidening::None,
                     deferred: deferred.into_boxed_slice(),
                     diagnostics,
                     undecorated_type,
