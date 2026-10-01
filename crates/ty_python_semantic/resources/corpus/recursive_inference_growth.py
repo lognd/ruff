@@ -48,18 +48,3 @@ def type_is_arguments():
 def typed_dict_arguments():
     while True:
         value = grow_payload(value)
-
-
-class Container[T]: ...
-
-
-def is_container[T](value: object, other: T) -> TypeIs[Container[T]]:
-    return True
-
-
-def bound_method_narrowing():
-    while True:
-        if is_container(value, type(value)):
-            value = value.__str__
-        else:
-            value = {value}

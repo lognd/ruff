@@ -2411,3 +2411,45 @@ def takes_str_or_float(x: float | str): ...
 
 takes_str_or_float(round(1.0))
 ```
+
+## Finite growth across repeated overloaded calls
+
+Overload selection can stop adding structure after several iterations. We retain the concrete
+results and reject assignments that exclude some of them.
+
+```py
+from typing import overload
+
+Level1 = list[int]
+Level2 = list[Level1]
+Level3 = list[Level2]
+Level4 = list[Level3]
+Level5 = list[Level4]
+Level6 = list[Level5]
+Level7 = list[Level6]
+
+@overload
+def step(value: int) -> Level1: ...
+@overload
+def step(value: Level1) -> Level2: ...
+@overload
+def step(value: Level2) -> Level3: ...
+@overload
+def step(value: Level3) -> Level4: ...
+@overload
+def step(value: Level4) -> Level5: ...
+@overload
+def step(value: Level5) -> Level6: ...
+@overload
+def step(value: Level6) -> Level7: ...
+@overload
+def step(value: Level7) -> Level7: ...
+def step(value: object) -> object:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    value = 1
+    while flag:
+        value = step(value)
+    bad: int = value  # error: [invalid-assignment]
+```

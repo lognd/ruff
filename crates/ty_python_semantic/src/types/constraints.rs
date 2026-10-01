@@ -86,7 +86,7 @@
 //!
 //! [duboc]: https://gldubc.github.io/#thesis
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display};
@@ -110,8 +110,8 @@ use crate::types::typevar::{
     BoundTypeVarIdentity, TypeVarConstraints, TypeVarInstance, TypeVarSet,
 };
 use crate::types::visitor::{
-    TypeCollector, TypeVisitor, any_over_type_expanding_aliases, max_constructor_and_typevar_depth,
-    walk_type_with_recursion_guard,
+    NonAtomicType, TypeCollector, TypeKind, TypeVisitor, any_over_type_expanding_aliases,
+    walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BoundTypeVarInstance, DynamicType, IntersectionType, Type,
@@ -1971,6 +1971,90 @@ impl<'db> UpperBound<'db> {
         }
         (node, source_order)
     }
+}
+
+/// Returns the maximum constructor depth of `ty` and the maximum nesting depth of any typevar that
+/// it contains.
+///
+/// Atomic types and bare typevars have constructor depth zero. The typevar depth is `0` if `ty`
+/// does not contain any typevars.
+fn max_constructor_and_typevar_depth<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> (u16, u16) {
+    fn max_constructor_and_typevar_depth_impl<'db>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        _dummy: (),
+    ) -> (u16, u16) {
+        struct TypeDepthVisitor<'a, 'db> {
+            env: &'a ProgramEnvironment<'db>,
+            active: RefCell<FxHashSet<Type<'db>>>,
+            current_depth: Cell<u16>,
+            max_constructor_depth: Cell<u16>,
+            max_typevar_depth: Cell<u16>,
+        }
+
+        impl<'db> TypeVisitor<'db> for TypeDepthVisitor<'_, 'db> {
+            fn program_environment(&self) -> &ProgramEnvironment<'db> {
+                self.env
+            }
+
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                if ty.is_type_var() {
+                    self.max_typevar_depth
+                        .set(self.max_typevar_depth.get().max(self.current_depth.get()));
+                    return;
+                }
+
+                let non_atomic = match TypeKind::from(ty) {
+                    TypeKind::Atomic => return,
+                    // A non-generic nominal instance is an opaque leaf. Its class literal
+                    // identifies the leaf but does not add nested type structure.
+                    TypeKind::NonAtomic(NonAtomicType::NominalInstance(instance))
+                        if !instance.class(db, self.env).is_generic() =>
+                    {
+                        return;
+                    }
+                    TypeKind::NonAtomic(non_atomic) => non_atomic,
+                };
+
+                if !self.active.borrow_mut().insert(ty) {
+                    return;
+                }
+
+                let current_depth = self.current_depth.get();
+                let nested_depth = current_depth.saturating_add(1);
+                self.current_depth.set(nested_depth);
+                self.max_constructor_depth
+                    .set(self.max_constructor_depth.get().max(nested_depth));
+                walk_non_atomic_type(db, non_atomic, self);
+                self.current_depth.set(current_depth);
+                self.active.borrow_mut().remove(&ty);
+            }
+        }
+
+        let visitor = TypeDepthVisitor {
+            env,
+            active: RefCell::default(),
+            current_depth: Cell::default(),
+            max_constructor_depth: Cell::default(),
+            max_typevar_depth: Cell::default(),
+        };
+        visitor.visit_type(db, ty);
+        (
+            visitor.max_constructor_depth.get(),
+            visitor.max_typevar_depth.get(),
+        )
+    }
+
+    max_constructor_and_typevar_depth_impl(db, env, ty, ())
 }
 
 impl ConstraintId {
@@ -4924,7 +5008,6 @@ impl SatisfiedClauses {
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
-    use std::cell::Cell;
 
     use super::variables::{
         ConcreteUpperBound, ConstraintProvenance, TypeVarRangeBound, UnsatisfiableBound,

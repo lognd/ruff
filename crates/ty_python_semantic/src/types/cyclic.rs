@@ -20,6 +20,11 @@
 //! avoid this is to prefer always calling `visitor.visit` only in the main recursive method on
 //! `Type`.
 
+mod inference;
+pub(super) use inference::{
+    RecursiveInferenceProjection, recursive_call_projections, resolve_recursive_projections,
+};
+
 use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Eq;
 use std::collections::hash_map::Entry;

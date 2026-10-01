@@ -58,7 +58,6 @@ use crate::types::diagnostic::TypeCheckDiagnostics;
 use crate::types::function::{FunctionDecorators, FunctionType};
 use crate::types::generics::Specialization;
 use crate::types::unpacker::{UnpackResult, Unpacker};
-use crate::types::visitor::has_constructor_growth;
 use crate::types::{
     ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeAndQualifiers,
     TypeQualifiers,
@@ -1229,27 +1228,6 @@ struct OtherDefinitionTypes<'db> {
 }
 
 impl<'db> DefinitionTypes<'db> {
-    /// Keep declarations and their qualifiers available to deferred checks after widening.
-    fn cycle_widened(self) -> Self {
-        match self {
-            Self::Empty => Self::Empty,
-            Self::Binding(_) => Self::Binding(Type::unknown()),
-            Self::Declaration(ty) => Self::Declaration(ty.map_type(|_| Type::unknown())),
-            Self::BindingAndDeclaration(ty) => {
-                Self::BindingAndDeclaration(ty.map_type(|_| Type::unknown()))
-            }
-            Self::Other(mut other) => {
-                for (_, ty) in &mut other.bindings {
-                    *ty = Type::unknown();
-                }
-                for (_, ty) in &mut other.declarations {
-                    *ty = ty.map_type(|_| Type::unknown());
-                }
-                Self::Other(other)
-            }
-        }
-    }
-
     fn from_parts(
         owner: Definition<'db>,
         bindings: Vec<DefinitionBinding<'db>>,
@@ -1488,9 +1466,6 @@ struct OtherDefinitionInferenceExtra<'db> {
     /// The fallback type for missing expressions/bindings/declarations or recursive type inference.
     cycle_recovery: Option<Type<'db>>,
 
-    /// Structural growth in this definition's cycle, separate from recovery inherited from children.
-    cycle_widening: CycleWidening,
-
     /// The definitions that have some deferred parts.
     deferred: Box<[Definition<'db>]>,
 
@@ -1510,14 +1485,6 @@ struct OtherDefinitionInferenceExtra<'db> {
     /// Type qualifiers (`Required`, `NotRequired`, etc.) for annotation expressions.
     /// Only populated for expressions that have non-empty qualifiers.
     qualifiers: FrozenMap<ExpressionNodeKey, TypeQualifiers>,
-}
-
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
-enum CycleWidening {
-    #[default]
-    None,
-    Growing(u32),
-    Widened,
 }
 
 impl<'db> DefinitionInferenceExtra<'db> {
@@ -1586,67 +1553,6 @@ impl<'db> DefinitionInferenceExtra<'db> {
 }
 
 impl<'db> DefinitionInference<'db> {
-    fn cycle_widening(&self) -> CycleWidening {
-        match self.extra.as_deref() {
-            Some(DefinitionInferenceExtra::Other(extra)) => extra.cycle_widening,
-            _ => CycleWidening::None,
-        }
-    }
-
-    /// Keep type results at Unknown while retaining diagnostics and metadata inferred from that
-    /// approximation. Subsequent iterations can finish deferred checks without restarting growth.
-    fn cycle_widened(mut self) -> Self {
-        for (_, ty) in &mut self.expressions {
-            *ty = Type::unknown();
-        }
-        self.types = self.types.cycle_widened();
-        let mut extra = self
-            .extra
-            .take()
-            .map_or_else(OtherDefinitionInferenceExtra::default, |extra| {
-                extra.into_other()
-            });
-        extra.cycle_recovery = Some(Type::unknown());
-        extra.cycle_widening = CycleWidening::Widened;
-        self.extra = Some(Box::new(DefinitionInferenceExtra::Other(Box::new(extra))));
-        self
-    }
-
-    /// Detect additional constructor nesting without penalizing large unchanged types or literal
-    /// unions. Inspect stored arguments without forcing lazy inference during cycle recovery.
-    fn has_cycle_type_growth(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        previous: &Self,
-        owner: Definition<'db>,
-    ) -> bool {
-        let grows = |current: Type<'db>, previous: Option<Type<'db>>| {
-            previous.is_some_and(|previous| has_constructor_growth(db, env, current, previous))
-        };
-        self.types.bindings(owner).any(|(definition, current)| {
-            grows(
-                current,
-                previous
-                    .types
-                    .binding_type(owner, definition)
-                    .or_else(|| previous.fallback_type()),
-            )
-        }) || self.types.declarations(owner).any(|(definition, current)| {
-            grows(
-                current.inner_type(),
-                previous
-                    .types
-                    .declaration_type(owner, definition)
-                    .map(|ty| ty.inner_type())
-                    .or_else(|| previous.fallback_type()),
-            )
-        }) || self
-            .expressions
-            .iter()
-            .any(|(expression, current)| grows(*current, previous.try_expression_type(*expression)))
-    }
-
     fn cycle_initial(
         db: &'db dyn Db,
         definition: Definition<'db>,
@@ -1735,11 +1641,6 @@ impl<'db> DefinitionInference<'db> {
         cycle: &salsa::Cycle,
         definition: Definition<'db>,
     ) -> DefinitionInference<'db> {
-        if previous_inference.cycle_widening() == CycleWidening::Widened
-            || self.fallback_type() == Some(Type::unknown())
-        {
-            return self.cycle_widened();
-        }
         let env = ProgramEnvironment::from_definition(definition);
         if cycle.iteration() > crate::TAINTED_CYCLES {
             self.widen_comparison_truthiness(db, &env, previous_inference);
@@ -1796,32 +1697,6 @@ impl<'db> DefinitionInference<'db> {
                 &mut extra.collection_use_constraints,
                 cycle,
             );
-        }
-
-        // Give finite dependencies time to propagate. Only consecutive increases in constructor
-        // depth consume the allowance; stable structure and ordinary literal widening do not.
-        if cycle.iteration() > crate::TAINTED_CYCLES
-            && self.has_cycle_type_growth(db, &env, previous_inference, definition)
-        {
-            let growth = match previous_inference.cycle_widening() {
-                CycleWidening::Growing(growth) => growth.saturating_add(1),
-                CycleWidening::None | CycleWidening::Widened => 1,
-            };
-            let limit = u32::try_from(cycle.head_ids().count())
-                .unwrap_or(u32::MAX)
-                .max(2)
-                .saturating_mul(2);
-            if growth >= limit {
-                return self.cycle_widened();
-            }
-            let mut extra = self
-                .extra
-                .take()
-                .map_or_else(OtherDefinitionInferenceExtra::default, |extra| {
-                    extra.into_other()
-                });
-            extra.cycle_widening = CycleWidening::Growing(growth);
-            self.extra = Some(Box::new(DefinitionInferenceExtra::Other(Box::new(extra))));
         }
 
         self

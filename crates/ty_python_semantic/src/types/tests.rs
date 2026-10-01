@@ -15,6 +15,12 @@ use ty_python_core::program::Program;
 use ty_python_core::{ProgramFile, TestProgramDb as _};
 
 #[test]
+fn recursive_projection_type_size() {
+    // Symbolic inference metadata must not increase the size of every cached type.
+    assert!(size_of::<Type<'_>>() <= 32);
+}
+
+#[test]
 fn member_lookup_result_size() {
     // Property diagnostics must not enlarge every cached member lookup.
     assert_eq!(
@@ -672,38 +678,6 @@ fn pending_narrowing_intersections_are_order_independent() {
             .build(),
         pending
     );
-}
-
-#[test]
-fn constructor_growth_ignores_unchanged_siblings_and_union_width() {
-    let db = setup_db();
-    let env = db.program_environment();
-    let int = KnownClass::Int.to_instance(&db, &env);
-    let list_of = |element| KnownClass::List.to_specialized_instance(&db, &env, &[element]);
-    let padding = list_of(list_of(list_of(int)));
-    let tuple_of = |element| Type::heterogeneous_tuple(&db, &env, [element, padding]);
-    let previous = tuple_of(int);
-    let current = tuple_of(list_of(int));
-
-    // The maximum depth of the entire tuple is unchanged, but its first element grows.
-    assert!(visitor::has_constructor_growth(
-        &db, &env, current, previous
-    ));
-    assert!(!visitor::has_constructor_growth(
-        &db, &env, previous, current
-    ));
-
-    let previous = tuple_of(Type::int_literal(1));
-    let current = UnionType::from_elements(&db, &env, [previous, tuple_of(Type::int_literal(2))]);
-    assert!(!visitor::has_constructor_growth(
-        &db, &env, current, previous
-    ));
-    assert!(!visitor::has_constructor_growth(
-        &db, &env, previous, current
-    ));
-
-    let growing = UnionType::from_elements(&db, &env, [current, tuple_of(list_of(int))]);
-    assert!(visitor::has_constructor_growth(&db, &env, growing, current));
 }
 
 #[test]

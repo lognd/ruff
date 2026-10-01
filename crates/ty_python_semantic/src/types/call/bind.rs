@@ -38,6 +38,7 @@ use crate::types::constraints::{
     ConstraintSetBuilder, PathBoundSolution, SolutionPaths, Solutions,
 };
 use crate::types::context::LintDiagnosticGuardBuilder;
+use crate::types::cyclic::recursive_call_projections;
 use crate::types::dedicated::pydantic::{self, ConfigBoolean};
 use crate::types::diagnostic::{
     CALL_NON_CALLABLE, CALL_TOP_CALLABLE, INVALID_ARGUMENT_TYPE, INVALID_DATACLASS,
@@ -5863,6 +5864,8 @@ struct InferredCall<'db> {
 struct CallInference<'a, 'db> {
     db: &'db dyn Db,
     env: &'a ProgramEnvironment<'db>,
+    /// Callable owning the signature, before this call's specialization.
+    signature_type: Type<'db>,
     /// Signature used for argument matching, before this call's specialization.
     signature: &'a Signature<'db>,
     /// Argument types for each available type context, including synthetic receivers.
@@ -6755,6 +6758,27 @@ impl<'db> CallInference<'_, 'db> {
                 continue;
             }
 
+            // Overloads can change the parameter flow as concrete arguments become available.
+            // Analyze only a single declared signature, keeping overloaded calls on their
+            // ordinary inference path.
+            if any_over_type(db, self.env, relation.argument_type, false, |ty| {
+                ty.is_recursive_divergent()
+            }) && let Type::FunctionLiteral(function) = self.signature_type
+                && function.signature(db).overloads.len() == 1
+                && let Some(context) = self.signature.generic_context
+            {
+                for (parameter, argument) in recursive_call_projections(
+                    db,
+                    self.env,
+                    context,
+                    relation.declared_type,
+                    relation.argument_type,
+                ) {
+                    // These are unbounded type variables and provisional arguments, so this
+                    // only adds inference constraints; it cannot report an argument mismatch.
+                    let _ = builder.infer(Type::TypeVar(parameter), argument);
+                }
+            }
             if let Err(error) = builder.infer(relation.declared_type, relation.argument_type) {
                 constraint_set_errors[relation.argument_index] = true;
                 specialization_errors.push(BindingError::SpecializationError {
@@ -8303,6 +8327,7 @@ impl<'db> Binding<'db> {
         let inferred = CallInference {
             db,
             env,
+            signature_type: self.signature_type,
             signature: &self.signature,
             arguments,
             argument_matches: &self.argument_matches,

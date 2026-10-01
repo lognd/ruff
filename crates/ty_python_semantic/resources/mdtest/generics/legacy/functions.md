@@ -2980,8 +2980,8 @@ def probe(value: Levels[int, str, bytes]):
 
 ## Recursively growing argument types
 
-Repeated calls can add a new layer to a type argument on every iteration. When inference cannot
-converge, we widen the recursive assignment to `Unknown` and retain the value from before the loop.
+Repeated calls can add a new layer to a type argument on every iteration. We preserve the recursive
+argument while retaining the tuple structure and the value from before the loop.
 
 ```py
 from typing import TypeVar
@@ -2995,7 +2995,7 @@ def repeat(flag: bool):
     value = (1,)
     while flag:
         value = grow(value)
-    reveal_type(value)  # revealed: tuple[Literal[1]] | Unknown
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[Divergent]
 ```
 
 ## Recursive growth beside unchanged type arguments
@@ -3015,12 +3015,12 @@ def repeat(flag: bool, padding: list[list[list[int]]]):
     value = (1, padding)
     while flag:
         value = grow(value)
-    reveal_type(value)  # revealed: tuple[Literal[1], list[list[list[int]]]] | Unknown
+    reveal_type(value)  # revealed: tuple[Literal[1], list[list[list[int]]]] | tuple[Divergent, list[list[list[int]]]]
 ```
 
 ## Diagnostics in recursively growing assignments
 
-Widening a recursive assignment preserves errors in the call and its arguments.
+Recovering a recursive type preserves errors in the call and its arguments.
 
 ```py
 from typing import TypeVar
@@ -3049,6 +3049,131 @@ def repeat(flag: bool):
     value = (1,)
     while flag:
         value = grow(value, 1 + "a")  # error: [unsupported-operator]
+```
+
+## Recursive calls in shared assignment expressions
+
+Chained and unpacked assignments preserve the same recursive structure as a single target.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
+
+def grow(value: tuple[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def chained(flag: bool):
+    value = (1,)
+    while flag:
+        other = value = grow(value)
+        reveal_type(value)  # revealed: tuple[Divergent]
+        reveal_type(other)  # revealed: tuple[Divergent]
+
+def unpacked(flag: bool):
+    value = (1,)
+    while flag:
+        value, other = grow(value), 42
+        reveal_type(value)  # revealed: tuple[Divergent]
+        reveal_type(other)  # revealed: Literal[42]
+```
+
+## Finite recursive parameter flows
+
+Identity calls, parameter permutations, and resets converge without losing their concrete types.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
+
+def identity(value: tuple[T]) -> tuple[T]:
+    return value
+
+def swap(value: tuple[T, U]) -> tuple[U, T]:
+    return value[1], value[0]
+
+def reset(value: tuple[T, U, V]) -> tuple[list[U], V, None]:
+    return [value[1]], value[2], None
+
+def identity_loop(flag: bool):
+    value = (1,)
+    while flag:
+        value = identity(value)
+    reveal_type(value)  # revealed: tuple[Literal[1]]
+
+def swap_loop(flag: bool):
+    value = (1, "a")
+    while flag:
+        value = swap(value)
+    reveal_type(value)  # revealed: tuple[Literal["a", 1], Literal[1, "a"]]
+
+def reset_loop(flag: bool):
+    value = (1, 2, 3)
+    while flag:
+        value = reset(value)
+    reveal_type(value)  # revealed: tuple[Literal[1], Literal[2], Literal[3]] | tuple[list[int | None], Literal[3] | None, None]
+```
+
+## Recursive calls whose structure cancels
+
+A call can add structure that a later call removes. Inference considers the complete cycle,
+including cycles spanning multiple assignments, before treating a type argument as recursively
+growing.
+
+```py
+from typing import Literal
+
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
+
+def grow(value: tuple[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def shrink(value: tuple[list[T]]) -> tuple[T]:
+    return (value[0][0],)
+
+def composed(flag: bool):
+    value = (1,)
+    while flag:
+        value = shrink(grow(value))
+    reveal_type(value)  # revealed: tuple[int]
+    bad: tuple[Literal[1]] = value  # error: [invalid-assignment]
+
+def mutual(flag: bool):
+    value = (1,)
+    other = ([1],)
+    while flag:
+        value = shrink(other)
+        other = grow(value)
+    reveal_type(value)  # revealed: tuple[int]
+    reveal_type(other)  # revealed: tuple[list[int]]
+    bad: tuple[Literal[1]] = value  # error: [invalid-assignment]
+```
+
+## Recursive calls stopped by a type variable bound
+
+A bound can reject a later call even when earlier calls keep adding structure.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T", bound=int | list[int] | list[list[int]])
+
+def grow(value: tuple[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = grow(value)  # error: [invalid-argument-type]
 ```
 
 ## Generic property setters implementing protocols

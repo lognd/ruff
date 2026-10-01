@@ -721,7 +721,7 @@ while value:
 ## Recursive annotations with multiple union arms
 
 A deferred `TypeOf` annotation can repeatedly wrap the entire previous union in each generic arm.
-Widening the annotation lets inference finish and preserves the assigned value's type.
+Retaining its recursive input lets inference converge while preserving the annotation's structure.
 
 ```toml
 [environment]
@@ -736,10 +736,10 @@ class Container[T]: ...
 
 value: list[TypeOf[value]] | Container[TypeOf[value]] | None
 value = [1]
-reveal_type(value)  # revealed: list[int]
+reveal_type(value)  # revealed: list[Divergent]
 ```
 
-Widening preserves the annotation's qualifiers, so a subsequent assignment to a `Final` variable is
+Recovery preserves the annotation's qualifiers, so a subsequent assignment to a `Final` variable is
 still rejected.
 
 ```py
