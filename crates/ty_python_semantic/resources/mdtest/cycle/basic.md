@@ -717,3 +717,86 @@ value = 0
 while value:
     value = new_class("C", (value,))
 ```
+
+## Recursive narrowing through bound methods
+
+The bound method's receiver and the narrowing target can both grow on every iteration. Inference
+widens the recursive assignment when structural normalization cannot reach a fixed point.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import TypeIs
+
+class Container[T]: ...
+
+def is_container[T](value: object, other: T) -> TypeIs[Container[T]]:
+    return True
+
+while True:
+    # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    if is_container(value, type(value)):
+        value = value.__str__
+    else:
+        value = {value}  # error: [possibly-unresolved-reference]
+    reveal_type(value)  # revealed: Unknown | set[Unknown]
+```
+
+## Recursive annotations with multiple union arms
+
+A deferred `TypeOf` annotation can repeatedly wrap the entire previous union in each generic arm.
+Widening the annotation lets inference finish and preserves the assigned value's type.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from __future__ import annotations
+from ty_extensions._internal import TypeOf
+
+class Container[T]: ...
+
+value: list[TypeOf[value]] | Container[TypeOf[value]] | None
+value = [1]
+reveal_type(value)  # revealed: list[int]
+```
+
+## Finite cycles across many attributes
+
+Large dependency cycles can need several iterations before the literal values widen to `int`. Their
+results remain precise even when the cycle includes many mutually dependent definitions.
+
+```py
+class WideCycle:
+    def __init__(self):
+        self.a = 0
+        self.b = 0
+        self.c = 0
+        self.d = 0
+        self.e = 0
+        self.f = 0
+        self.g = 0
+        self.h = 0
+        self.i = 0
+        self.j = 1
+
+    def update(self):
+        self.a = self.b + self.c + self.d + self.e + self.f + self.g + self.h + self.i + self.j
+        self.b = self.a + self.c + self.d + self.e + self.f + self.g + self.h + self.i + self.j
+        self.c = self.a + self.b + self.d + self.e + self.f + self.g + self.h + self.i + self.j
+        self.d = self.a + self.b + self.c + self.e + self.f + self.g + self.h + self.i + self.j
+        self.e = self.a + self.b + self.c + self.d + self.f + self.g + self.h + self.i + self.j
+        self.f = self.a + self.b + self.c + self.d + self.e + self.g + self.h + self.i + self.j
+        self.g = self.a + self.b + self.c + self.d + self.e + self.f + self.h + self.i + self.j
+        self.h = self.a + self.b + self.c + self.d + self.e + self.f + self.g + self.i + self.j
+        self.i = self.a + self.b + self.c + self.d + self.e + self.f + self.g + self.h + self.j
+        self.j = self.a + self.b + self.c + self.d + self.e + self.f + self.g + self.h + self.i
+
+        reveal_type(self.a)  # revealed: int
+```

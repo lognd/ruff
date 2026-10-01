@@ -52,12 +52,14 @@ use rustc_hash::FxHashMap;
 use salsa;
 use salsa::plumbing::AsId;
 use std::borrow::Cow;
+use std::cell::Cell;
 pub(super) use ty_python_core::frozen::{FrozenMap, FrozenSet, FrozenValueMap};
 
 use crate::types::diagnostic::TypeCheckDiagnostics;
 use crate::types::function::{FunctionDecorators, FunctionType};
 use crate::types::generics::Specialization;
 use crate::types::unpacker::{UnpackResult, Unpacker};
+use crate::types::visitor::{TypeKind, any_over_type_including_alias_arguments};
 use crate::types::{
     ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeAndQualifiers,
     TypeQualifiers,
@@ -1553,6 +1555,77 @@ impl<'db> DefinitionInferenceExtra<'db> {
 }
 
 impl<'db> DefinitionInference<'db> {
+    /// Bound unstable inference results after structural cycle recovery has had time to converge.
+    /// More cycle heads need more iterations to propagate a finite result through their dependencies.
+    fn cycle_growth_limits(cycle: &salsa::Cycle) -> (usize, u32) {
+        // Bound both breadth and depth. The minimum iteration allowance leaves room for literal
+        // unions and other existing normalization rules to stabilize before giving up precision.
+        let heads = cycle.head_ids().count().clamp(2, 64);
+        let nodes = (heads * 8).min(128);
+        let iterations =
+            (crate::TAINTED_CYCLES + u32::try_from(heads).unwrap_or(64) * 2).clamp(16, 128);
+        (nodes, iterations)
+    }
+
+    /// Stop an ascending chain without re-entering annotation inference or retaining growing metadata.
+    /// Unlike an ordinary cycle seed, this result is absorbing: later iterations keep returning it.
+    fn cycle_widened(mut self) -> Self {
+        self.expressions = FrozenMap::default();
+        self.types = DefinitionTypes::Empty;
+        self.extra = Some(Box::new(DefinitionInferenceExtra::Other(Box::new(
+            OtherDefinitionInferenceExtra {
+                cycle_recovery: Some(Type::unknown()),
+                ..OtherDefinitionInferenceExtra::default()
+            },
+        ))));
+        self
+    }
+
+    /// Check only changed types, without forcing lazy inference while recovering a query cycle.
+    /// Atomic types do not count toward structural growth: in particular, literal unions have
+    /// their own widening rules and can remain precise as their alternatives accumulate.
+    fn exceeds_cycle_type_node_limit(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        previous: &Self,
+        owner: Definition<'db>,
+        limit: usize,
+    ) -> bool {
+        let exceeds_limit = |current: Type<'db>, previous: Option<Type<'db>>| {
+            if Some(current) == previous {
+                return false;
+            }
+            let count = Cell::new(0);
+            any_over_type_including_alias_arguments(db, env, current, |ty| {
+                if matches!(TypeKind::from(ty), TypeKind::NonAtomic(_)) {
+                    count.set(count.get() + 1);
+                }
+                count.get() > limit
+            })
+        };
+        self.types.bindings(owner).any(|(definition, current)| {
+            exceeds_limit(
+                current,
+                previous
+                    .types
+                    .binding_type(owner, definition)
+                    .or_else(|| previous.fallback_type()),
+            )
+        }) || self.types.declarations(owner).any(|(definition, current)| {
+            exceeds_limit(
+                current.inner_type(),
+                previous
+                    .types
+                    .declaration_type(owner, definition)
+                    .map(|ty| ty.inner_type())
+                    .or_else(|| previous.fallback_type()),
+            )
+        }) || self.expressions.iter().any(|(expression, current)| {
+            exceeds_limit(*current, Some(previous.expression_type(*expression)))
+        })
+    }
+
     fn cycle_initial(
         db: &'db dyn Db,
         definition: Definition<'db>,
@@ -1641,6 +1714,9 @@ impl<'db> DefinitionInference<'db> {
         cycle: &salsa::Cycle,
         definition: Definition<'db>,
     ) -> DefinitionInference<'db> {
+        if previous_inference.fallback_type() == Some(Type::unknown()) {
+            return self.cycle_widened();
+        }
         let env = ProgramEnvironment::from_definition(definition);
         if cycle.iteration() > crate::TAINTED_CYCLES {
             self.widen_comparison_truthiness(db, &env, previous_inference);
@@ -1697,6 +1773,22 @@ impl<'db> DefinitionInference<'db> {
                 &mut extra.collection_use_constraints,
                 cycle,
             );
+        }
+
+        let (node_limit, iteration_limit) = Self::cycle_growth_limits(cycle);
+        // Unioning successive results prevents oscillation, but cannot terminate an infinite
+        // ascending chain such as `tuple[list[int]]`, `tuple[list[list[int]]]`, and so on.
+        if (cycle.iteration() > crate::TAINTED_CYCLES + 1
+            && self.exceeds_cycle_type_node_limit(
+                db,
+                &env,
+                previous_inference,
+                definition,
+                node_limit,
+            ))
+            || (cycle.iteration() > iteration_limit && self != *previous_inference)
+        {
+            return self.cycle_widened();
         }
 
         self
