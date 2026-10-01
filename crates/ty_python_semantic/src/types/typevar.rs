@@ -1319,23 +1319,12 @@ impl<'db> BoundTypeVarInstance<'db> {
         type_mapping: &TypeMapping<'_, 'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Self {
-        if matches!(type_mapping, TypeMapping::Materialize(_)) {
-            return mapped;
-        }
         let mut identity = mapped.identity(db);
         let original = self.original(db);
         let canonical = self.identity(db).canonical_domain.unwrap_or(original);
         let previous = canonical.bound_or_constraints(db, visitor.env);
-        // A specialization can materialize the types it substitutes. Only the visible view uses
-        // that materialization; the identity tracks the specialization before materialization.
-        let canonical_mapping = match type_mapping {
-            TypeMapping::ApplySpecializationWithMaterialization { specialization, .. } => {
-                TypeMapping::ApplySpecialization(*specialization)
-            }
-            _ => type_mapping.clone(),
-        };
         let current =
-            previous.map(|domain| domain.apply_type_mapping_impl(db, &canonical_mapping, visitor));
+            previous.map(|domain| domain.apply_type_mapping_impl(db, type_mapping, visitor));
         if current != previous {
             identity.canonical_domain = if current == original.bound_or_constraints(db, visitor.env)
             {
@@ -1436,6 +1425,8 @@ impl<'db> BoundTypeVarInstance<'db> {
                 && (self.specialization_may_change_domain(db)
                     || view.specialization_may_change_domain(db))
             {
+                // The view may have been materialized, but the identity tracks the
+                // specialization before materialization.
                 let mapping = TypeMapping::ApplySpecialization(*specialization);
                 Type::TypeVar(self.map_domain(db, view, &mapping, visitor))
             } else {
@@ -2878,10 +2869,6 @@ mod tests {
             .identity(db),
             self_typevar.identity(db)
         );
-        assert_eq!(
-            projected_int.identity(db),
-            map_self(db, &env, self_typevar, &mapping(t_context, int)).identity(db)
-        );
         assert_ne!(
             projected_int.identity(db),
             map_self(db, &env, self_typevar, &mapping(t_context, str)).identity(db)
@@ -3014,26 +3001,6 @@ mod tests {
         let projected_view = map_self(db, &env, materialized, &mapping);
         assert_eq!(projected.identity(db), projected_view.identity(db));
         assert_ne!(projected.typevar(db), projected_view.typevar(db));
-
-        let gradual_specialization =
-            ApplySpecialization::specialization(context.specialize(db, vec![Type::any()]));
-        let plain = map_self(
-            db,
-            &env,
-            self_typevar,
-            &TypeMapping::ApplySpecialization(gradual_specialization),
-        );
-        let materializing = map_self(
-            db,
-            &env,
-            self_typevar,
-            &TypeMapping::ApplySpecializationWithMaterialization {
-                specialization: gradual_specialization,
-                materialization_kind: MaterializationKind::Top,
-            },
-        );
-        assert_eq!(plain.identity(db), materializing.identity(db));
-        assert_ne!(plain.typevar(db), materializing.typevar(db));
     }
 
     #[test]

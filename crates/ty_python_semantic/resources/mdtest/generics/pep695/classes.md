@@ -2452,6 +2452,30 @@ def wrong_return[T](a: Box[str], b: Box[T], cond: bool) -> tuple[Box[str], str]:
     return box.pair()  # error: [invalid-return-type]
 ```
 
+An argument must be compatible with every receiver specialization:
+
+```py
+def argument_for_one_receiver(a: Box[int], b: Box[str], cond: bool) -> None:
+    a.pair_with_values([1])  # no diagnostic
+    b.pair_with_values(["s"])  # no diagnostic
+
+    box = a if cond else b
+    box.pair_with_values([1])  # error: [invalid-argument-type]
+    box.pair_with_values(["s"])  # error: [invalid-argument-type]
+
+    box = b if cond else a
+    box.pair_with_values([1])  # error: [invalid-argument-type]
+    box.pair_with_values(["s"])  # error: [invalid-argument-type]
+
+    pair = a.pair_with_values if cond else b.pair_with_values
+    pair([1])  # error: [invalid-argument-type]
+    pair(["s"])  # error: [invalid-argument-type]
+
+    pair = b.pair_with_values if cond else a.pair_with_values
+    pair([1])  # error: [invalid-argument-type]
+    pair(["s"])  # error: [invalid-argument-type]
+```
+
 ## Calling specialized bound methods through aliases and inheritance
 
 A class and its type arguments can be specialized through aliases without changing its bound method

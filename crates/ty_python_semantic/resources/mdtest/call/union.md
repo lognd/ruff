@@ -156,6 +156,44 @@ def construct(use_fancy: bool):
     reveal_type(result)  # revealed: dict[str, int]
 ```
 
+Even when both classes inherit the same constructor, each arm can infer a different type argument:
+
+```py
+class Base[T]:
+    def __init__(self, value: T) -> None: ...
+
+class Value[T](Base[T]): ...
+class Pair[T](Base[tuple[T, T]]): ...
+
+def construct_value_or_pair(use_value: bool, value: tuple[int, int]) -> None:
+    factory = Value if use_value else Pair
+    reveal_type(factory(value))  # revealed: Value[tuple[int, int]] | Pair[int]
+
+    reversed_factory = Pair if use_value else Value
+    reveal_type(reversed_factory(value))  # revealed: Pair[int] | Value[tuple[int, int]]
+```
+
+The same inference applies to legacy generic classes:
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class LegacyBase(Generic[T]):
+    def __init__(self, value: T) -> None: ...
+
+class LegacyValue(LegacyBase[T]): ...
+class LegacyPair(LegacyBase[tuple[T, T]]): ...
+
+def construct_legacy_value_or_pair(use_value: bool, value: tuple[int, int]) -> None:
+    factory = LegacyValue if use_value else LegacyPair
+    reveal_type(factory(value))  # revealed: LegacyValue[tuple[int, int]] | LegacyPair[int]
+
+    reversed_factory = LegacyPair if use_value else LegacyValue
+    reveal_type(reversed_factory(value))  # revealed: LegacyPair[int] | LegacyValue[tuple[int, int]]
+```
+
 ## Constructor checking through `type[]` in a union
 
 A call on a union of `type[]` types must satisfy every constructor.
