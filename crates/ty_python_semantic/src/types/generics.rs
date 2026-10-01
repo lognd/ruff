@@ -4270,6 +4270,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                             // of `ty` and `bound` is non-empty. Since `Never` is always a valid
                             // intersection if the types are disjoint, we don't need to perform any
                             // check here.
+                            // Top-materialize the declared bound so that an `Any` bound does not
+                            // introduce a gradual component into concrete inference evidence.
+                            let bound = bound.top_materialization(db, self.env);
                             self.add_type_mapping(
                                 bound_typevar,
                                 IntersectionType::from_two_elements(db, self.env, bound, ty),
