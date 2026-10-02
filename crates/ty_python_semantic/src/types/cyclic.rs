@@ -22,7 +22,8 @@
 
 mod inference;
 pub(super) use inference::{
-    RecursiveInferenceProjection, recursive_call_projections, resolve_recursive_projections,
+    RecursiveInferenceProjection, discard_recursive_projections, recursive_call_projections,
+    resolve_recursive_projections, structurally_growing_parameters, unchanged_recursive_arguments,
 };
 
 use std::cell::{Cell, OnceCell, RefCell};

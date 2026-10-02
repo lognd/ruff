@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from typing import TypeGuard, TypeIs, TypedDict
+from typing_extensions import TypeForm
 
 
 def grow[A, B](value: tuple[A, B]) -> tuple[list[A], tuple[A, B]]:
@@ -48,3 +49,26 @@ def type_is_arguments():
 def typed_dict_arguments():
     while True:
         value = grow_payload(value)
+
+
+class Pair[A, B]: ...
+
+
+def grow_class[A, B](value: Pair[type[A], B]) -> Pair[type[list[A]], Pair[type[A], B]]:
+    raise NotImplementedError
+
+
+def grow_form[A, B](
+    value: Pair[TypeForm[A], B],
+) -> Pair[TypeForm[list[A]], Pair[TypeForm[A], B]]:
+    raise NotImplementedError
+
+
+def class_arguments():
+    while True:
+        value = grow_class(value)
+
+
+def type_form_arguments():
+    while True:
+        value = grow_form(value)

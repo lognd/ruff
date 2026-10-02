@@ -115,6 +115,22 @@ impl<'db> CallArgumentTypes<'db> {
 }
 
 impl<'a, 'db> CallArguments<'a, 'db> {
+    /// Map every inferred argument type, cloning only when a type changes.
+    pub(super) fn map_types(&self, mut map: impl FnMut(Type<'db>) -> Type<'db>) -> Cow<'_, Self> {
+        let mut arguments = Cow::Borrowed(self);
+        for (index, argument) in self.items.iter().enumerate() {
+            for (context, ty) in argument.types.iter() {
+                let mapped = map(ty);
+                if mapped != ty {
+                    arguments.to_mut().items[index]
+                        .types
+                        .insert(context, mapped);
+                }
+            }
+        }
+        arguments
+    }
+
     /// Create `CallArguments` from AST arguments. We will use the provided callback to obtain the
     /// type of each splatted argument, so that we can determine its length. All other arguments
     /// will remain uninitialized.

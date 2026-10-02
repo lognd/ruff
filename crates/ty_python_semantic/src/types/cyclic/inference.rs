@@ -19,7 +19,7 @@ use crate::types::generics::GenericContext;
 use crate::types::visitor::any_over_type_including_alias_arguments;
 use crate::types::{
     BoundTypeVarIdentity, BoundTypeVarInstance, DivergentFlags, DivergentOrigin, DivergentType,
-    Type, TypeContext, TypeMapping,
+    Type, TypeContext, TypeMapping, UnionType,
 };
 use crate::{Db, FxOrderMap, ProgramEnvironment};
 
@@ -154,6 +154,119 @@ fn collect_flow<'db>(
             .all(|(left, right)| collect_flow(db, env, parameters, left, right, edges))
 }
 
+/// Find parameters that gain structure when the result is fed back into a destructured argument.
+pub(in crate::types) fn structurally_growing_parameters<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    context: GenericContext<'db>,
+    formal: Type<'db>,
+    returned: Type<'db>,
+) -> FxHashSet<BoundTypeVarIdentity<'db>> {
+    // Direct type-variable arguments already preserve recursive markers without projections.
+    if matches!(formal, Type::TypeVar(_)) {
+        return FxHashSet::default();
+    }
+    let parameters: FxHashSet<_> = context
+        .variables(db)
+        .map(|parameter| parameter.identity(db))
+        .collect();
+    let mut graph = SpecializationFlowGraph::default();
+    if !collect_flow(db, env, &parameters, formal, returned, &mut graph.edges) {
+        return FxHashSet::default();
+    }
+    let components = graph.strongly_connected_parameter_components(parameters.clone());
+    parameters
+        .into_iter()
+        .filter(|parameter| {
+            graph.edges.iter().any(|edge| {
+                edge.kind == FlowKind::Nested
+                    && components.get(&edge.from) == components.get(&edge.to)
+                    && components.get(&edge.from) == components.get(parameter)
+            })
+        })
+        .collect()
+}
+
+/// Recover a finite parameter from concrete alternatives beside its symbolic projection.
+/// This preserves unchanged fields when another field in the same argument grows.
+fn projection_evidence<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    formal: Type<'db>,
+    returned: Type<'db>,
+    parameter: BoundTypeVarInstance<'db>,
+) -> Type<'db> {
+    if let Type::Union(union) = returned {
+        return UnionType::from_elements_cycle_recovery(
+            db,
+            env,
+            union
+                .elements(db)
+                .iter()
+                .map(|returned| projection_evidence(db, env, formal, *returned, parameter)),
+        );
+    }
+    if formal == Type::TypeVar(parameter) {
+        return if any_over_type_including_alias_arguments(db, env, returned, |ty| ty.is_divergent())
+        {
+            Type::Never
+        } else {
+            returned
+        };
+    }
+    if let Some((left, right)) = matching_arguments(db, env, formal, returned) {
+        return UnionType::from_elements_cycle_recovery(
+            db,
+            env,
+            left.into_iter()
+                .zip(right)
+                .map(|(left, right)| projection_evidence(db, env, left, right, parameter)),
+        );
+    }
+    Type::Never
+}
+
+/// Find argument components that a call returns unchanged, including their concrete constraints.
+/// An invariant component can bound another component that grows in the same argument.
+pub(in crate::types) fn unchanged_recursive_arguments<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    formal: Type<'db>,
+    actual: Type<'db>,
+    returned: Type<'db>,
+) -> Vec<(Type<'db>, Type<'db>)> {
+    if let Type::Union(union) = actual {
+        return union
+            .elements(db)
+            .iter()
+            .flat_map(|actual| unchanged_recursive_arguments(db, env, formal, *actual, returned))
+            .collect();
+    }
+    if formal == returned && !matches!(formal, Type::TypeVar(_)) {
+        return vec![(formal, actual)];
+    }
+    let Some((left, output)) = matching_arguments(db, env, formal, returned) else {
+        return Vec::new();
+    };
+    let input = if actual.is_divergent() {
+        vec![actual; left.len()]
+    } else if let Some((_, input)) = matching_arguments(db, env, formal, actual) {
+        input
+    } else {
+        return Vec::new();
+    };
+    if left.len() != input.len() || left.len() != output.len() {
+        return Vec::new();
+    }
+    left.into_iter()
+        .zip(input)
+        .zip(output)
+        .flat_map(|((formal, actual), returned)| {
+            unchanged_recursive_arguments(db, env, formal, actual, returned)
+        })
+        .collect()
+}
+
 /// Seed parameters whose formal argument structure is hidden by a recursive marker.
 fn project<'db>(
     db: &'db dyn Db,
@@ -171,6 +284,16 @@ fn project<'db>(
     if let Type::Divergent(divergent) = actual
         && let DivergentOrigin::Recursive(_) = divergent.origin
     {
+        // Ordinary generic classes retain recursive argument markers. Fixed tuples instead
+        // infer their parameters by destructuring elements that are not available yet. Once
+        // growth is established, propagate its marker through the resulting nested types too.
+        if !divergent.flags.contains(DivergentFlags::GROWING_PROJECTION)
+            && formal
+                .exact_tuple_instance_spec(db)
+                .is_none_or(|tuple| tuple.as_fixed_length().is_none())
+        {
+            return;
+        }
         let sources: FxHashSet<_> = SourceParameterCollector::classify(db, env, parameters, formal)
             .map(|(parameter, _)| parameter)
             .collect();
@@ -243,7 +366,8 @@ pub(in crate::types) fn recursive_call_projections<'db>(
 }
 
 /// Recover projections only at their originating query, after all intervening calls have run.
-/// When growth is not established, discard the extra seed and use ordinary argument inference.
+/// Preserve finite fields alongside a growing parameter using ordinary inference's evidence.
+/// If there is no growing parameter, discard the symbolic seed and use the concrete alternatives.
 pub(in crate::types) fn resolve_recursive_projections<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -276,34 +400,21 @@ pub(in crate::types) fn resolve_recursive_projections<'db>(
         let DivergentOrigin::Projection(projection) = divergent.origin else {
             continue;
         };
-        let parameters = projection
-            .context(db)
-            .variables(db)
-            .map(|parameter| parameter.identity(db))
-            .collect();
-        let mut graph = SpecializationFlowGraph::default();
-        let matches = collect_flow(
+        let growing = structurally_growing_parameters(
             db,
             env,
-            &parameters,
+            projection.context(db),
             projection.formal(db),
             symbolic,
-            &mut graph.edges,
         );
-        let components = graph.strongly_connected_parameter_components(parameters);
-        let parameter = projection.parameter(db).identity(db);
-        let grows = matches
-            && graph.edges.iter().any(|edge| {
-                edge.kind == FlowKind::Nested
-                    && components.get(&edge.from) == components.get(&edge.to)
-                    && components.get(&edge.from) == components.get(&parameter)
-            });
-        *replacement = if grows {
+        *replacement = if growing.contains(&projection.parameter(db).identity(db)) {
             Type::Divergent(DivergentType {
                 origin: projection.root(db).origin,
                 flags: divergent.flags | DivergentFlags::GROWING_PROJECTION,
                 ..*divergent
             })
+        } else if !growing.is_empty() {
+            projection_evidence(db, env, projection.formal(db), ty, projection.parameter(db))
         } else {
             Type::Never
         };
@@ -314,4 +425,31 @@ pub(in crate::types) fn resolve_recursive_projections<'db>(
         &TypeMapping::ReplaceRecursiveProjections(&replacements),
         TypeContext::default(),
     )
+}
+
+/// Remove symbolic union alternatives before a call whose overloads may change parameter flow.
+/// Replacing only the projection with `Never` could create a real type such as `list[Never]`;
+/// that type would take part in subsequent iterations instead of remaining a provisional seed.
+pub(in crate::types) fn discard_recursive_projections<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Type<'db> {
+    let discard = |ty| {
+        if any_over_type_including_alias_arguments(
+            db,
+            env,
+            ty,
+            |nested| matches!(nested, Type::Divergent(divergent) if matches!(divergent.origin, DivergentOrigin::Projection(_))),
+        ) {
+            Type::Never
+        } else {
+            ty
+        }
+    };
+    if let Type::Union(union) = ty {
+        union.map(db, env, |ty| discard(*ty))
+    } else {
+        discard(ty)
+    }
 }

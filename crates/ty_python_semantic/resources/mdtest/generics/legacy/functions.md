@@ -3110,13 +3110,14 @@ def swap_loop(flag: bool):
     value = (1, "a")
     while flag:
         value = swap(value)
-    reveal_type(value)  # revealed: tuple[Literal["a", 1], Literal[1, "a"]]
+    reveal_type(value)  # revealed: tuple[Literal[1], Literal["a"]] | tuple[Literal["a"], Literal[1]]
 
 def reset_loop(flag: bool):
     value = (1, 2, 3)
     while flag:
         value = reset(value)
-    reveal_type(value)  # revealed: tuple[Literal[1], Literal[2], Literal[3]] | tuple[list[int | None], Literal[3] | None, None]
+    # revealed: tuple[Literal[1], Literal[2], Literal[3]] | tuple[list[int], Literal[3], None] | tuple[list[int], None, None] | tuple[list[None], None, None]
+    reveal_type(value)
 ```
 
 ## Recursive calls whose structure cancels
@@ -3174,6 +3175,154 @@ def repeat(flag: bool):
     value = (1,)
     while flag:
         value = grow(value)  # error: [invalid-argument-type]
+```
+
+## Recursive calls constrained by another argument
+
+An invariant argument fixes the type parameter on every iteration. The next call is invalid when the
+growing value no longer fits that type, regardless of argument order.
+
+```py
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+
+def grow(value: tuple[T], limit: list[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def repeat(flag: bool, limit: list[int]):
+    value = (1,)
+    while flag:
+        value = grow(value, limit)  # error: [invalid-argument-type]
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[list[int]]
+    bad: tuple[int] = value  # error: [invalid-assignment]
+
+def reordered(flag: bool, limit: list[int]):
+    value = (1,)
+    while flag:
+        value = grow(limit=limit, value=value)  # error: [invalid-argument-type]
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[list[int]]
+```
+
+Fixing the parameter to `object` permits every iteration. A gradual argument does not impose the
+same restriction.
+
+```py
+def object_limit(flag: bool, limit: list[object]):
+    value = (1,)
+    while flag:
+        value = grow(value, limit)  # no diagnostic
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[list[object]]
+
+def gradual_limit(flag: bool, limit: list[Any]):
+    value = (1,)
+    while flag:
+        value = grow(value, limit)  # no diagnostic
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[Divergent]
+```
+
+## Recursive calls constrained within the same argument
+
+An unchanged invariant component can constrain a growing component of the same argument. We retain
+that constraint when recovering from the invalid call.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def grow(value: tuple[T, list[T]]) -> tuple[list[T], list[T]]:
+    return [value[0]], value[1]
+
+def limited(flag: bool, limit: list[int]):
+    value = (1, limit)
+    while flag:
+        value = grow(value)  # error: [invalid-argument-type]
+    reveal_type(value)  # revealed: tuple[Literal[1], list[int]] | tuple[list[int], list[int]]
+    bad: tuple[int, list[int]] = value  # error: [invalid-assignment]
+
+def object_limit(flag: bool, limit: list[object]):
+    value = (1, limit)
+    while flag:
+        value = grow(value)  # no diagnostic
+    reveal_type(value)  # revealed: tuple[Literal[1], list[object]] | tuple[list[object], list[object]]
+```
+
+## Recursive calls constrained by a callback
+
+A callback that only accepts integers rejects a later list argument. A callback accepting `object`
+does not limit the growth.
+
+```py
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
+
+def grow(value: tuple[T], consume: Callable[[T], None]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def limited(flag: bool, consume: Callable[[int], None]):
+    value = (1,)
+    while flag:
+        value = grow(value, consume)  # error: [invalid-argument-type]
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[list[int]]
+    bad: tuple[int] = value  # error: [invalid-assignment]
+
+def unlimited(flag: bool, consume: Callable[[object], None]):
+    value = (1,)
+    while flag:
+        value = grow(value, consume)  # no diagnostic
+    reveal_type(value)  # revealed: tuple[Literal[1]] | tuple[Divergent]
+```
+
+## Recursive calls constrained by an intervening bound
+
+A bound on an intervening call can reject a later iteration even when the growing function has
+unbounded type parameters.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U", bound=int | list[int])
+
+def grow(value: tuple[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+def cap(value: tuple[U]) -> tuple[U]:
+    return value
+
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = cap(grow(value))  # error: [invalid-argument-type]
+    bad: tuple[int] = value  # error: [invalid-assignment]
+```
+
+## Recursive calls stopped by an intervening overload
+
+The first overload resets a nested list to an integer. Keeping the loop's alternatives separate
+allows each iteration to select the appropriate overload, so the result remains finite.
+
+```py
+from typing import TypeVar, overload
+
+T = TypeVar("T")
+
+def grow(value: tuple[T]) -> tuple[list[T]]:
+    return ([value[0]],)
+
+@overload
+def cap(value: tuple[list[list[int]]]) -> tuple[int]: ...
+@overload
+def cap(value: tuple[T]) -> tuple[T] | tuple[int]: ...
+def cap(value: object) -> object: ...
+def repeat(flag: bool):
+    value = (1,)
+    while flag:
+        value = cap(grow(value))  # no diagnostic
+    reveal_type(value)  # revealed: tuple[int] | tuple[list[int]]
+    bad: tuple[int] = value  # error: [invalid-assignment]
 ```
 
 ## Generic property setters implementing protocols

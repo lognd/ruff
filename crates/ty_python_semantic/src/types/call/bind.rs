@@ -38,7 +38,10 @@ use crate::types::constraints::{
     ConstraintSetBuilder, PathBoundSolution, SolutionPaths, Solutions,
 };
 use crate::types::context::LintDiagnosticGuardBuilder;
-use crate::types::cyclic::recursive_call_projections;
+use crate::types::cyclic::{
+    discard_recursive_projections, recursive_call_projections, structurally_growing_parameters,
+    unchanged_recursive_arguments,
+};
 use crate::types::dedicated::pydantic::{self, ConfigBoolean};
 use crate::types::diagnostic::{
     CALL_NON_CALLABLE, CALL_TOP_CALLABLE, INVALID_ARGUMENT_TYPE, INVALID_DATACLASS,
@@ -58,6 +61,7 @@ use crate::types::infer::original_class_type;
 use crate::types::known_instance::{
     FieldInstance, InternedConstraintSetSolution, MethodWrapper, MethodWrapperKind,
 };
+use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::{
     CallableSignature, Parameter, ParameterDisplayName, ParameterKind, Parameters, ParametersKind,
     PartialApplication, PartialSignatureApplication,
@@ -72,7 +76,7 @@ use crate::types::visitor::{
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
-    DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
+    DATACLASS_FLAGS, DataclassFlags, DataclassParams, DivergentFlags, DynamicType, GenericAlias,
     InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
     LiteralValueTypeKind, NominalInstanceType, PropertyInstanceType, TypeContext, TypeIdentity,
     TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
@@ -3812,6 +3816,161 @@ impl<'db> CallableBinding<'db> {
         call_arguments: &CallArguments<'_, 'db>,
         call_expression_tcx: TypeContext<'db>,
     ) {
+        // A projection describes one symbolic path through a call. An overload can select a
+        // different path on a later iteration, and a type-variable bound can reject that iteration.
+        // Keep the concrete alternatives and evaluate them separately below.
+        let call_arguments = if self.overloads.len() > 1
+            || self.overloads.iter().any(|binding| {
+                binding.signature.generic_context.is_some_and(|context| {
+                    context.variables(db).any(|parameter| {
+                        parameter
+                            .typevar(db)
+                            .bound_or_constraints(db, env)
+                            .is_some()
+                    })
+                })
+            }) {
+            call_arguments.map_types(|ty| discard_recursive_projections(db, env, ty))
+        } else {
+            Cow::Borrowed(call_arguments)
+        };
+        if matches!(call_arguments, Cow::Owned(_)) {
+            // Variadic matches cache component types, so rematch after filtering their inputs.
+            for overload in &mut self.overloads {
+                overload.reset(db);
+            }
+            self.match_parameters(db, env, &call_arguments);
+        }
+
+        if !self.try_expand_recursive_arguments(db, env, constraints, &call_arguments) {
+            self.check_types_impl(db, env, constraints, &call_arguments, call_expression_tcx);
+        }
+    }
+
+    /// Infer recursive fixed-tuple alternatives separately before selecting overloads or merging
+    /// type-variable solutions. Merging `tuple[int] | tuple[list[int]]` into `tuple[T]` first
+    /// loses the distinction needed for a later call to reset only the nested-list alternative.
+    fn try_expand_recursive_arguments(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        constraints: &ConstraintSetBuilder<'db>,
+        call_arguments: &CallArguments<'_, 'db>,
+    ) -> bool {
+        if !matches!(self.signature_type, Type::FunctionLiteral(_))
+            || !self
+                .overloads
+                .iter()
+                .any(|binding| binding.signature.generic_context.is_some())
+        {
+            return false;
+        }
+        let types = || {
+            call_arguments
+                .iter_types()
+                .filter_map(CallArgumentTypes::get_default)
+        };
+        let recursive = types().any(|ty| {
+            let Type::Union(union) = ty else {
+                return false;
+            };
+            union.elements(db).iter().any(|ty| {
+                ty.exact_tuple_instance_spec(db)
+                    .is_some_and(|tuple| tuple.as_fixed_length().is_some())
+            }) && any_over_type(db, env, ty, false, |ty| {
+                ty.is_recursive_divergent()
+                    || matches!(ty, Type::Union(union) if union.recursively_defined(db).is_yes())
+            })
+        });
+        if !recursive {
+            return false;
+        }
+        let already_growing = types().any(|ty| {
+            any_over_type(db, env, ty, false, |ty| {
+                matches!(ty, Type::Divergent(divergent)
+                    if divergent.flags.contains(DivergentFlags::GROWING_PROJECTION))
+            })
+        });
+        // Expanding an already normalized infinite sequence would enumerate its finite prefixes
+        // again. Its recursive marker already represents those alternatives.
+        if already_growing {
+            return false;
+        }
+        let snapshotter = CallableBindingSnapshotter::new((0..self.overloads.len()).collect());
+        for expansion in call_arguments.expansions(db, env).iter() {
+            let Expansion::Expanded(expanded) = expansion else {
+                break;
+            };
+            let mut cases = Vec::new();
+            for arguments in &expanded {
+                let mut binding = self.clone();
+                for overload in &mut binding.overloads {
+                    overload.reset(db);
+                }
+                binding.match_parameters(db, env, arguments);
+                // A context inferred from the combined union would merge its alternatives again.
+                // Each case obtains its specialization from its own arguments instead.
+                binding.check_types_impl(db, env, constraints, arguments, TypeContext::default());
+                if binding.matching_overloads().next().is_none() {
+                    break;
+                }
+                let return_type = binding.return_type();
+                // A bare recursive marker has no structure to infer from. If that leaves a
+                // parameter unsolved, infer it from the complete argument union instead; turning
+                // the missing evidence into `Unknown` would feed a spurious type into the loop.
+                if arguments
+                    .iter_types()
+                    .filter_map(CallArgumentTypes::get_default)
+                    .any(|ty| ty.is_recursive_divergent())
+                    && any_over_type(db, env, return_type, false, |ty| ty.is_dynamic())
+                    && !any_over_type(db, env, return_type, false, |ty| {
+                        ty.is_recursive_divergent()
+                    })
+                {
+                    break;
+                }
+                cases.push(ExpandedCallEvaluation {
+                    return_type,
+                    selected_overloads: binding
+                        .selected_overloads()
+                        .map(|(index, _)| index)
+                        .collect(),
+                    snapshot: snapshotter.take(&binding),
+                });
+            }
+            if cases.len() == expanded.len()
+                && let Some((first, rest)) = cases.split_first()
+            {
+                let mut merged = first.snapshot.clone();
+                for case in rest {
+                    merged.update(&case.snapshot);
+                }
+                snapshotter.restore(self, merged);
+                let mut returned =
+                    UnionBuilder::new(db, env).or_recursively_defined(RecursivelyDefined::Yes);
+                for case in &cases {
+                    returned.add_in_place(case.return_type);
+                }
+                self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(
+                    Box::new(ExpandedOverloadCall {
+                        return_type: returned.build(),
+                        cases: cases.into_boxed_slice(),
+                    }),
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_types_impl(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        constraints: &ConstraintSetBuilder<'db>,
+        call_arguments: &CallArguments<'_, 'db>,
+        call_expression_tcx: TypeContext<'db>,
+    ) {
         // If this callable is a bound method, prepend the self instance onto the arguments list
         // before checking.
         let call_arguments = call_arguments.with_self(self.bound_type);
@@ -6446,9 +6605,39 @@ impl<'db> CallInference<'_, 'db> {
                     });
                 }
 
+                // Keep an independently inferred upper bound when a recursive argument grows
+                // beyond it. Unioning that bound with the invalid argument would make recovery
+                // grow indefinitely and would hide the argument mismatch.
+                let growing_parameters: FxHashSet<_> = self
+                    .argument_relations()
+                    .flat_map(|relation| {
+                        structurally_growing_parameters(
+                            db,
+                            self.env,
+                            generic_context,
+                            relation.declared_type,
+                            self.return_ty,
+                        )
+                    })
+                    .collect();
                 builder.build_diagnostic_inference_with(
-                    self.argument_relations()
-                        .map(|relation| (relation.declared_type, relation.argument_type)),
+                    self.argument_relations().flat_map(|relation| {
+                        std::iter::once((relation.declared_type, relation.argument_type)).chain(
+                            (!growing_parameters.is_empty())
+                                .then(|| {
+                                    unchanged_recursive_arguments(
+                                        db,
+                                        self.env,
+                                        relation.declared_type,
+                                        relation.argument_type,
+                                        self.return_ty,
+                                    )
+                                })
+                                .into_iter()
+                                .flatten(),
+                        )
+                    }),
+                    &growing_parameters,
                     choose,
                 )
             }
@@ -6774,6 +6963,39 @@ impl<'db> CallInference<'_, 'db> {
                     relation.declared_type,
                     relation.argument_type,
                 ) {
+                    // Invariant and contravariant occurrences can impose an upper bound that
+                    // stops growth. Wait for their concrete evidence instead of treating a
+                    // provisional recursive argument as permission to grow without limit.
+                    let constrained = self.argument_relations().any(|other| {
+                        let same_argument = other.argument_index == relation.argument_index;
+                        let limits = if same_argument {
+                            unchanged_recursive_arguments(
+                                db,
+                                self.env,
+                                other.declared_type,
+                                other.argument_type,
+                                self.return_ty,
+                            )
+                        } else {
+                            vec![(other.declared_type, other.argument_type)]
+                        };
+                        limits.into_iter().any(|(formal, actual)| {
+                            let mut constrained = false;
+                            formal.visit_specialization(db, self.env, |ty, variance| {
+                                constrained |=
+                                    ty == Type::TypeVar(parameter) && !variance.is_covariant();
+                            });
+                            constrained
+                                && (same_argument
+                                    || any_over_type(db, self.env, actual, false, |ty| {
+                                        ty.is_divergent()
+                                    })
+                                    || !actual.is_assignable_to(db, self.env, formal))
+                        })
+                    });
+                    if constrained {
+                        continue;
+                    }
                     // These are unbounded type variables and provisional arguments, so this
                     // only adds inference constraints; it cannot report an argument mismatch.
                     let _ = builder.infer(Type::TypeVar(parameter), argument);
@@ -8790,7 +9012,7 @@ struct CallableBindingSnapshotter(Vec<usize>);
 impl CallableBindingSnapshotter {
     /// Creates a new snapshotter for the given indexes of the matched overloads.
     fn new(indexes: Vec<usize>) -> Self {
-        debug_assert!(indexes.len() > 1);
+        debug_assert!(!indexes.is_empty());
         CallableBindingSnapshotter(indexes)
     }
 

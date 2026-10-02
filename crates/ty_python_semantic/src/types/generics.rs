@@ -2867,24 +2867,95 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     /// Each argument relation is solved independently, then its solutions are merged into the
     /// legacy type map. This preserves enough information to report the conflicting arguments
     /// even when a migrated inference path only populated `pending`.
+    /// For structurally growing parameters in `prefer_upper`, retain concrete upper bounds
+    /// instead of unioning them with incompatible lower bounds from the growing argument.
     pub(crate) fn build_diagnostic_inference_with(
         &mut self,
         argument_relations: impl IntoIterator<Item = (Type<'db>, Type<'db>)>,
+        prefer_upper: &FxHashSet<BoundTypeVarIdentity<'db>>,
         mut choose: impl FnMut(
             BoundTypeVarInstance<'db>,
             Option<&CandidateTypeVarSolution<'db>>,
         ) -> Option<PathBoundSolution<'db>>,
     ) -> TypeVarInference<'db> {
         let db = self.db;
+        let mut upper_recovery = FxHashMap::default();
         for (formal, actual) in argument_relations {
             let when =
                 actual.when_constraint_set_assignable_to(db, self.env, formal, self.constraints);
             let analysis = self.analyze_constraint_set(when);
+            let mut upper_parameters = FxHashSet::default();
+            if !prefer_upper.is_empty() {
+                formal.visit_specialization(db, self.env, |ty, variance| {
+                    if let Type::TypeVar(parameter) = ty
+                        && !variance.is_covariant()
+                        && prefer_upper.contains(&parameter.identity(db))
+                    {
+                        upper_parameters.insert(parameter.identity(db));
+                    }
+                });
+            }
+            if let ConstraintSetAnalysis::Constrained(solutions) = &analysis {
+                for identity in self
+                    .generic_context
+                    .variables(db)
+                    .map(|parameter| parameter.identity(db))
+                    .filter(|identity| upper_parameters.contains(identity))
+                {
+                    // Alternative solutions within one relation are disjoined. A bound is
+                    // useful only if every alternative supplies concrete evidence for it.
+                    let upper =
+                        solutions
+                            .as_slice()
+                            .iter()
+                            .try_fold(Type::Never, |upper, solution| {
+                                let binding = solution.solved_typevars.iter().find(|binding| {
+                                    binding.bound_typevar.identity(db) == identity
+                                })?;
+                                (!binding.solution.has_typevar(db, self.env)
+                                    && binding.solution.is_fully_static(db, self.env)
+                                    && !any_over_type(
+                                        db,
+                                        self.env,
+                                        binding.solution,
+                                        false,
+                                        |ty| ty.is_divergent(),
+                                    ))
+                                .then(|| {
+                                    UnionType::from_two_elements(
+                                        db,
+                                        self.env,
+                                        upper,
+                                        binding.solution,
+                                    )
+                                })
+                            });
+                    if let Some(upper) = upper {
+                        // Separate argument relations must hold simultaneously.
+                        upper_recovery
+                            .entry(identity)
+                            .and_modify(|existing| {
+                                *existing = IntersectionType::from_two_elements(
+                                    db, self.env, *existing, upper,
+                                );
+                            })
+                            .or_insert(upper);
+                    }
+                }
+            }
             self.project_for_legacy_fallback(&analysis);
         }
 
-        let inference =
-            self.compatibility_inference_with(TypeVarInferenceFallback::Unsatisfiable, &mut choose);
+        let inference = self.compatibility_inference_with(
+            TypeVarInferenceFallback::Unsatisfiable,
+            &mut |parameter, bounds| {
+                upper_recovery
+                    .get(&parameter.identity(db))
+                    .copied()
+                    .map(PathBoundSolution::Solved)
+                    .or_else(|| choose(parameter, bounds))
+            },
+        );
         self.finish_inference(inference, SolutionBudget::default())
     }
 
@@ -5055,6 +5126,7 @@ mod tests {
 
         let diagnostic = builder.build_diagnostic_inference_with(
             [(Type::TypeVar(t), int), (Type::TypeVar(t), str)],
+            &FxHashSet::default(),
             |_, _| None,
         );
         assert_eq!(
